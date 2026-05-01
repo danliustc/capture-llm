@@ -36,6 +36,7 @@
 (require 'llm)
 (require 'json)
 (require 'org)
+(require 'subr-x)
 
 ;;; ============================================================
 ;;; Customization
@@ -57,37 +58,37 @@ Example: (make-llm-openai :key \"sk-...\")
 (defcustom capture-llm-categories
   '(("inbox"
      :description "Unclassified tasks"
-     :file nil  ; resolved to my/org-inbox at runtime
-     :heading nil
+     :file my/org-inbox
+     :heading "Inbox"
      :state "TODO"
      :tags nil)
     ("personal"
      :description "Personal tasks (appointments, shopping, errands)"
-     :file nil  ; resolved to my/org-tasks
+     :file my/org-tasks
      :heading "Tasks"
      :state "TODO"
      :tags ("personal"))
     ("work"
      :description "Work tasks (meetings, reports, projects)"
-     :file nil
+     :file my/org-tasks
      :heading "Tasks"
      :state "TODO"
      :tags ("work"))
     ("someday"
      :description "Non-urgent tasks for someday/maybe"
-     :file nil
+     :file my/org-tasks
      :heading "Tasks"
      :state "SOMEDAY"
      :tags nil)
     ("ideas"
      :description "Thoughts, inspiration, brain dumps (not actionable)"
-     :file nil
+     :file my/org-ideas
      :heading "Ideas"
      :state nil
      :tags nil)
     ("reading"
      :description "Reading notes, book reviews, articles"
-     :file nil
+     :file my/org-ideas
      :heading "Reading"
      :state nil
      :tags nil))
@@ -126,15 +127,51 @@ If nil, a sensible default is generated from category and tag config."
   :group 'capture-llm)
 
 ;;; ============================================================
+;;; Debug
+;;; ============================================================
+
+(defvar capture-llm--debug-last-response nil
+  "Last raw LLM response, for debugging.")
+
+(defvar capture-llm--debug-last-result nil
+  "Last parsed result, for debugging.")
+
+(defun capture-llm-test (&optional text)
+  "Test classification and show raw LLM output.
+If TEXT is nil, prompt in minibuffer."
+  (interactive)
+  (let ((input (or text (read-string "Test input: "))))
+    (message "capture-llm: Classifying...")
+    (capture-llm--classify
+     input
+     (lambda (result)
+       (setq capture-llm--debug-last-result result)
+       (with-current-buffer (get-buffer-create "*capture-llm-debug*")
+         (erase-buffer)
+         (insert "=== Raw LLM Response ===\n\n"
+                 capture-llm--debug-last-response
+                 "\n\n=== Parsed Result ===\n\n"
+                 (pp-to-string result)
+                 "\n=== Org Entry ===\n\n"
+                 (capture-llm--format-org-entry result))
+         (goto-char (point-min))
+         (display-buffer (current-buffer)))
+       (message "capture-llm: Done, see *capture-llm-debug*"))
+     (lambda (err)
+       (message "capture-llm ERROR: %s" err)))))
+
+;;; ============================================================
 ;;; Internal helpers
 ;;; ============================================================
 
 (defun capture-llm--get-tags ()
   "Return available tags as a list of strings."
   (or capture-llm-tags
-      (mapcar (lambda (tag)
-                (if (consp tag) (car tag) tag))
-              org-tag-alist)))
+      (delq nil
+            (mapcar (lambda (tag)
+                      (let ((name (if (consp tag) (car tag) tag)))
+                        (when (stringp name) name)))
+                    org-tag-alist))))
 
 (defun capture-llm--resolve-file (file)
   "Resolve FILE to a path string.
@@ -156,11 +193,15 @@ FILE can be a string or a symbol whose value is a string."
                                   (plist-get (cdr cat) :description)))
                         categories "\n"))
              (tags (capture-llm--get-tags))
-             (tag-str (string-join tags ", ")))
+             (tag-str (string-join tags ", "))
+             (now (current-time))
+             (today (format-time-string "%Y-%m-%d" now))
+             (weekday (format-time-string "%a" now)))
         (concat
          "You are a task classification assistant. "
          "Given user input, determine the category, tags, TODO state, "
          "and extract any time information.\n\n"
+         "Current date: " today " (" weekday ")\n\n"
          "Available categories:\n" cat-desc "\n\n"
          "Available tags: " tag-str "\n\n"
          "Return JSON with these fields:\n"
@@ -168,13 +209,22 @@ FILE can be a string or a symbol whose value is a string."
          "- tags: array of applicable tags (empty array if none fit)\n"
          "- todo_state: \"TODO\", \"NEXT\", \"WAITING\", \"SOMEDAY\", or null\n"
          "- title: concise task title (remove time info from title)\n"
-         "- scheduled: \"YYYY-MM-DD\" or null\n"
-         "- deadline: \"YYYY-MM-DD\" or null\n"
+         "- scheduled: \"YYYY-MM-DD Day HH:MM\" (include time if mentioned) or \"YYYY-MM-DD\" (date only) or null\n"
+         "  Day is abbreviated weekday: Mon, Tue, Wed, Thu, Fri, Sat, Sun\n"
+         "- deadline: \"YYYY-MM-DD Day HH:MM\" or \"YYYY-MM-DD\" or null\n"
+         "  Day is abbreviated weekday: Mon, Tue, Wed, Thu, Fri, Sat, Sun\n"
          "- notes: extra notes or null\n\n"
          "Rules:\n"
-         "- If the input mentions a specific date/time, put it in scheduled\n"
-         "- If it mentions a deadline/due date, put it in deadline\n"
-         "- \"明天\" means tomorrow, \"下周\" means next week, etc.\n"
+         "- Convert Chinese relative dates using the current date above:\n"
+         "  今天 = today, 明天 = today+1, 后天 = today+2, 大后天 = today+3\n"
+         "  下周X = next week's weekday X, 周X = this week's weekday X\n"
+         "  下个月 = next month, 这个月 = this month\n"
+         "- If time is mentioned (e.g. \"下午3点\", \"15:00\"), include it: \"YYYY-MM-DD Day HH:MM\"\n"
+         "  Example: \"2026-05-01 Thu 15:00\"\n"
+         "- If only a date is mentioned, use \"YYYY-MM-DD\" format\n"
+         "- \"deadline\" means the last possible date; \"scheduled\" means when to start/do it\n"
+         "- If only one date is given and it's a due date (截止, 前, 之前), use deadline\n"
+         "- If only one date is given and it's a plan (去, 做, 见), use scheduled\n"
          "- title should be concise, without time information\n"
          "- If unsure about category, use \"inbox\"\n"
          "- Use \"ideas\" for non-actionable thoughts, set todo_state to null\n"
@@ -186,7 +236,7 @@ FILE can be a string or a symbol whose value is a string."
   "Parse JSON from TEXT, handling potential markdown code fences."
   (let ((cleaned text))
     ;; Strip markdown code fences if present
-    (when (string-match "^```\\(?:json\\)?\\s-*\n\\(.*\\)\\s-*\n```$" cleaned)
+    (when (string-match "^```\\(?:json\\)?[[:space:]]*\n\\(\\(?:.\\|\n\\)*?\\)\n```" cleaned)
       (setq cleaned (match-string 1 cleaned)))
     ;; Also try to find JSON object if there's extra text
     (unless (string-prefix-p "{" (string-trim cleaned))
@@ -210,8 +260,10 @@ Call ERROR-CALLBACK with error message on failure."
      capture-llm-provider
      prompt
      (lambda (response)
+       (setq capture-llm--debug-last-response response)
        (condition-case err
            (let ((result (capture-llm--parse-json response)))
+             (setq capture-llm--debug-last-result result)
              (funcall callback result))
          (error
           (funcall error-callback
@@ -249,13 +301,44 @@ Call ERROR-CALLBACK with error message on failure."
   "Extract notes from RESULT."
   (cdr (assq 'notes result)))
 
+(defun capture-llm--present-string-p (value)
+  "Return non-nil when VALUE is a non-empty string."
+  (and (stringp value) (not (string-empty-p value))))
+
+(defun capture-llm--string-or-nil (value)
+  "Return VALUE when it is a non-empty string, otherwise nil."
+  (when (capture-llm--present-string-p value)
+    value))
+
 (defun capture-llm--category-config (category-name)
   "Get the config plist for CATEGORY-NAME."
   (cdr (assoc category-name capture-llm-categories)))
 
-(defun capture-llm--format-org-entry (result)
-  "Format RESULT into an org entry string."
+(defun capture-llm--entry-level-for-result (result)
+  "Return the org heading level that RESULT will be written with."
   (let* ((cat-name (capture-llm--result-category result))
+         (cat-cfg (capture-llm--category-config cat-name))
+         (file (capture-llm--resolve-file
+                (or (plist-get cat-cfg :file) 'my/org-inbox)))
+         (heading (plist-get cat-cfg :heading))
+         (level 1))
+    (when heading
+      (setq level 2)
+      (when (file-exists-p file)
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (when (re-search-forward
+                 (concat "^\\(\\*+\\) " (regexp-quote heading)) nil t)
+            (setq level (1+ (length (match-string 1))))))))
+    level))
+
+(defun capture-llm--format-org-entry (result &optional level)
+  "Format RESULT into an org entry string.
+LEVEL is the heading depth (default 1)."
+  (let* ((level (or level 1))
+         (stars (make-string level ?*))
+         (cat-name (capture-llm--result-category result))
          (cat-cfg (capture-llm--category-config cat-name))
          (todo (or (capture-llm--result-todo result)
                    (plist-get cat-cfg :state)))
@@ -267,36 +350,41 @@ Call ERROR-CALLBACK with error message on failure."
          (tag-str (if all-tags
                       (concat " :" (string-join all-tags ":") ":")
                     ""))
-         (scheduled (capture-llm--result-scheduled result))
-         (deadline (capture-llm--result-deadline result))
-         (notes (capture-llm--result-notes result))
+         (scheduled (capture-llm--string-or-nil
+                     (capture-llm--result-scheduled result)))
+         (deadline (capture-llm--string-or-nil
+                    (capture-llm--result-deadline result)))
+         (notes (capture-llm--string-or-nil (capture-llm--result-notes result)))
          (parts (list
-                 ;; Heading
-                 (concat "* " (if todo (concat todo " ") "") title tag-str)
-                 ;; Properties drawer
-                 ":PROPERTIES:"
-                 (concat ":CREATED: " (format-time-string "[%Y-%m-%d %a %H:%M]"))
-                 ":END:")))
-    ;; Scheduled
+                 (concat stars " " (if todo (concat todo " ") "") title tag-str))))
     (when scheduled
-      (push (concat "SCHEDULED: <" scheduled ">") parts))
-    ;; Deadline
+      (setq parts (append parts (list (concat "SCHEDULED: <" scheduled ">")))))
     (when deadline
-      (push (concat "DEADLINE: <" deadline ">") parts))
-    ;; Body: notes
-    (when (and notes (not (string-empty-p notes)))
-      (push notes parts))
-    ;; Reverse and join
-    (string-join (nreverse parts) "\n")))
+      (setq parts (append parts (list (concat "DEADLINE: <" deadline ">")))))
+    (setq parts
+          (append parts
+                  (list ":PROPERTIES:"
+                        (concat ":CREATED: "
+                                (format-time-string "[%Y-%m-%d %a %H:%M]"))
+                        ":END:")))
+    (when notes
+      (setq parts (append parts (list notes))))
+    (string-join parts "\n")))
 
 (defun capture-llm--write-entry (result)
   "Write the org entry from RESULT to the appropriate file."
+  (capture-llm--write-entry-text result nil))
+
+(defun capture-llm--write-entry-text (result entry-text)
+  "Write ENTRY-TEXT for RESULT to the appropriate file.
+If ENTRY-TEXT is nil, format RESULT as an org entry."
   (let* ((cat-name (capture-llm--result-category result))
          (cat-cfg (capture-llm--category-config cat-name))
          (file (capture-llm--resolve-file
                 (or (plist-get cat-cfg :file) 'my/org-inbox)))
          (heading (plist-get cat-cfg :heading))
-         (entry (capture-llm--format-org-entry result)))
+         (entry-level 1)
+         entry)
     ;; Ensure file exists
     (unless (file-exists-p file)
       (make-directory (file-name-directory file) t)
@@ -307,11 +395,16 @@ Call ERROR-CALLBACK with error message on failure."
       (when heading
         (goto-char (point-min))
         (if (re-search-forward
-             (concat "^\\*+ " (regexp-quote heading)) nil t)
-            (goto-char (point-at-eol))
+             (concat "^\\(\\*+\\) " (regexp-quote heading)) nil t)
+            (let ((parent-level (length (match-string 1))))
+              (setq entry-level (1+ parent-level))
+              (goto-char (point-at-eol)))
           ;; Heading not found, create it at end
           (goto-char (point-max))
           (insert (concat "\n* " heading))))
+      ;; Format entry with correct level unless caller provided edited text.
+      (setq entry (or entry-text
+                      (capture-llm--format-org-entry result entry-level)))
       ;; Insert entry
       (unless (bolp) (insert "\n"))
       (insert "\n" entry "\n")
@@ -358,7 +451,9 @@ Call ERROR-CALLBACK with error message on failure."
      "\n"
      "────────────────────────────────────────────\n"
      "Org entry:\n\n"
-     (capture-llm--format-org-entry result) "\n"
+     (capture-llm--format-org-entry
+      result
+      (capture-llm--entry-level-for-result result)) "\n"
      "\n"
      "────────────────────────────────────────────\n"
      "  y = confirm  |  e = edit entry  |  n = cancel\n")))
@@ -408,10 +503,11 @@ The LLM classifies the input and writes it to the appropriate org file."
              ('confirm
               (capture-llm--write-entry result))
              ('edit
-              (let* ((entry (capture-llm--format-org-entry result))
+              (let* ((entry (capture-llm--format-org-entry
+                             result
+                             (capture-llm--entry-level-for-result result)))
                      (edited (read-string "Edit entry: " entry)))
-                (setf (cdr (assq 'title result)) edited)
-                (capture-llm--write-entry result)))
+                (capture-llm--write-entry-text result edited)))
              ('cancel
               (message "capture-llm: Cancelled")))
          (capture-llm--write-entry result)))
