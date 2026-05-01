@@ -8,15 +8,25 @@ Type a sentence, let the LLM figure out where it goes.
 
 ### Dependencies
 
+- Emacs 27.1+
+- [llm.el](https://github.com/ahyatt/llm) (GNU ELPA)
+- Org 9.0+
+
 ```elisp
-;; In your init.el or config.org
+;; Install llm.el first
 (use-package llm
   :ensure t)
 ```
 
 ### capture-llm
 
-Clone this repo and add to your load path:
+Clone this repo:
+
+```bash
+git clone https://github.com/user/capture-llm ~/Code/capture-llm
+```
+
+Add to your config:
 
 ```elisp
 (add-to-list 'load-path "~/Code/capture-llm")
@@ -36,6 +46,12 @@ Or with `use-package`:
 ### 1. Configure the LLM provider
 
 ```elisp
+;; DeepSeek
+(require 'llm-deepseek)
+(setq capture-llm-provider
+      (make-llm-deepseek :key "your-api-key"
+                         :chat-model "deepseek-chat"))
+
 ;; OpenAI
 (setq capture-llm-provider (make-llm-openai :key "sk-..."))
 
@@ -52,36 +68,7 @@ Or with `use-package`:
 (setq capture-llm-provider (make-llm-openrouter :key "sk-or-..."))
 ```
 
-### 2. Configure categories (optional)
-
-The default categories work with a standard GTD setup. To customize:
-
-```elisp
-(setq capture-llm-categories
-  '(("inbox"
-     :description "Unclassified tasks"
-     :file my/org-inbox
-     :heading nil
-     :state "TODO"
-     :tags nil)
-    ("personal"
-     :description "Personal tasks"
-     :file my/org-tasks
-     :heading "Tasks"
-     :state "TODO"
-     :tags ("personal"))
-    ;; ... add more as needed
-    ))
-```
-
-Each category maps to:
-- `:file` — target org file (string path or symbol like `my/org-inbox`)
-- `:heading` — heading under which to insert (nil = file top level)
-- `:state` — default TODO state
-- `:tags` — default tags for this category
-- `:description` — shown to the LLM for classification
-
-### 3. Bind a key
+### 2. Bind a key
 
 ```elisp
 (global-set-key (kbd "C-c C-l") 'capture-llm-capture)
@@ -91,22 +78,21 @@ Each category maps to:
 
 ```
 C-c C-l            Type your task, LLM classifies it, preview, confirm
-C-u C-c C-l        Quick capture (skip preview)
 ```
 
 ### Examples
 
 | Input | Category | Tags | State | Time |
 |-------|----------|------|-------|------|
-| "明天下午3点去医院体检" | personal | health | TODO | scheduled: tomorrow |
-| "下周三前交项目周报" | work | — | TODO | deadline: next Wednesday |
+| "明天下午3点去医院体检" | personal | personal, health | TODO | scheduled: 2026-05-02 Fri 15:00 |
+| "下周三前交项目周报" | work | work | TODO | deadline: 2026-05-06 Wed |
 | "想学摄影" | someday | — | SOMEDAY | — |
 | "今天天气真好" | ideas | — | — | — |
-| "买牛奶" | inbox | errands | TODO | — |
+| "给老婆买巧克力饮料" | personal | personal, errands | TODO | — |
 
-### Preview buffer
+### Preview
 
-After classification, you'll see a preview:
+After classification, a preview buffer shows the result:
 
 ```
 ╔══════════════════════════════════════════╗
@@ -119,24 +105,77 @@ After classification, you'll see a preview:
   State:      TODO
   Title:      去医院体检
   Tags:       personal, health
-  Scheduled:  2026-05-02
+  Scheduled:  2026-05-02 Fri 15:00
   Deadline:   —
   Notes:      —
 
   y = confirm  |  e = edit entry  |  n = cancel
 ```
 
+Press `y` to write, `e` to edit the entry before writing, `n` to cancel.
+
+## Default categories
+
+| Category | File | Heading | Default State | Default Tags |
+|----------|------|---------|---------------|--------------|
+| inbox | inbox.org | Inbox | TODO | — |
+| personal | tasks.org | Tasks | TODO | personal |
+| work | tasks.org | Tasks | TODO | work |
+| someday | tasks.org | Tasks | SOMEDAY | — |
+| ideas | ideas.org | Ideas | — | — |
+| reading | ideas.org | Reading | — | — |
+
+Entries are inserted under the heading at the correct nesting level. For example, if `* Tasks` is a top-level heading, new entries are inserted as `**`.
+
 ## Customization
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `capture-llm-provider` | nil | llm.el provider (required) |
-| `capture-llm-categories` | GTD defaults | Category definitions |
-| `capture-llm-tags` | nil (auto from org) | Available tags |
+| `capture-llm-provider` | nil | llm.el provider (**required**) |
+| `capture-llm-categories` | GTD defaults | Category definitions (see below) |
+| `capture-llm-tags` | nil (auto from `org-tag-alist`) | Available tags for classification |
 | `capture-llm-confirm` | t | Show preview before writing |
-| `capture-llm-extract-time` | t | Extract scheduled/deadline |
-| `capture-llm-system-prompt` | nil (auto-generated) | Override classification prompt |
-| `capture-llm-temperature` | 0.1 | LLM temperature |
+| `capture-llm-extract-time` | t | Extract scheduled/deadline from input |
+| `capture-llm-system-prompt` | nil (auto-generated) | Override the classification prompt |
+| `capture-llm-temperature` | 0.1 | LLM temperature (lower = more deterministic) |
+
+### Custom categories
+
+```elisp
+(setq capture-llm-categories
+  '(("inbox"
+     :description "Unclassified tasks"
+     :file my/org-inbox
+     :heading "Inbox"
+     :state "TODO"
+     :tags nil)
+    ("personal"
+     :description "Personal tasks"
+     :file my/org-tasks
+     :heading "Tasks"
+     :state "TODO"
+     :tags ("personal"))
+    ;; ... add more as needed
+    ))
+```
+
+Each category:
+- `:file` — target org file (string path or symbol like `my/org-inbox`)
+- `:heading` — heading under which to insert (entries auto-nest at the right level)
+- `:state` — default TODO state (nil for non-task entries)
+- `:tags` — default tags for this category
+- `:description` — shown to the LLM for classification
+
+## Debug
+
+`M-x capture-llm-test` — test classification without writing to any file. Shows the raw LLM response, parsed result, and formatted org entry in `*capture-llm-debug*`.
+
+## Acknowledgments
+
+- [llm.el](https://github.com/ahyatt/llm) — provider-agnostic LLM abstraction for Emacs, the foundation of this project
+- [org-mode](https://orgmode.org/) — the reason we use Emacs in the first place
+
+Built with the help of [Xiaomi MiMo](https://github.com/XiaomiMiMo) and [OpenAI Codex](https://openai.com/index/codex/).
 
 ## License
 
