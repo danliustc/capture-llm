@@ -1,47 +1,45 @@
 # capture-llm
 
-Type a sentence. LLM decides where it goes.
+Type a sentence. Let the LLM decide where it goes.
 
-capture-llm 是一个 Emacs 包，让你用自然语言做 org-capture。你只需要打一句话，LLM 会自动判断它属于哪个分类、该打什么标签、有没有时间信息，然后写入对应的 org 文件。
+capture-llm 是一个 Emacs 包，用自然语言创建 org 条目。你输入一句话，它会自动判断分类、标题、TODO 状态、标签，以及 `SCHEDULED` / `DEADLINE`，然后写入对应的 org 文件。
 
-```
+```text
 C-c C-l
 > 下周三前交项目周报
 ```
 
-LLM 输出：
+预览：
 
-```
+```text
 Category:   work
 File:       tasks.org
 Heading:    Tasks
 State:      TODO
+Title:      交项目周报
 Tags:       work
-Deadline:   2026-05-06 Wed
+Deadline:   2026-05-13 Wed
 ```
 
-按 `y` 确认写入，`e` 编辑，`n` 取消。
+按 `y` 确认，`e` 编辑，`c` 改分类，`n` 取消。
 
-## 它解决什么问题
+## Features
 
-org-capture 模板很多，但每次都要想"这条该用哪个模板"。capture-llm 把这个决策交给 LLM：
+- 自然语言捕获 org 任务和笔记
+- 自动分类、打标签、选择 TODO 状态
+- 自动提取计划时间和截止时间
+- 写入前预览，可编辑或改分类
+- 支持快速捕获、调试分类、扫描 org 文件结构
 
-- "明天下午3点去医院体检" -> personal / TODO / scheduled
-- "想学摄影" -> someday / SOMEDAY
-- "给老婆买巧克力" -> personal / errands / TODO
-- "今天天气真好" -> ideas / 无状态
+## Install
 
-你只管说人话，分类的事交给模型。
-
-## 安装
-
-### 依赖
+依赖：
 
 - Emacs 27.1+
-- [llm.el](https://github.com/ahyatt/llm) (GNU ELPA)
+- [llm.el](https://github.com/ahyatt/llm)
 - Org 9.0+
 
-### 方案一：从源码安装
+源码安装：
 
 ```bash
 git clone https://github.com/danliustc/capture-llm ~/Code/capture-llm
@@ -52,174 +50,150 @@ git clone https://github.com/danliustc/capture-llm ~/Code/capture-llm
 
 (use-package capture-llm
   :load-path "~/Code/capture-llm"
-  :bind ("C-c C-l" . capture-llm-capture))
+  :bind (("C-c C-l" . capture-llm-capture)))
 ```
 
-### 方案二：通过包管理器安装
-
-**Emacs 29+ (package-vc, 内置)**
+也可以用 `package-vc`、`straight.el` 或 `elpaca` 从 GitHub 安装：
 
 ```elisp
-(use-package llm :ensure t)
+;; Emacs 29+
 (package-vc-install "https://github.com/danliustc/capture-llm")
 
+;; straight.el
 (use-package capture-llm
-  :bind ("C-c C-l" . capture-llm-capture))
+  :straight (:host github :repo "danliustc/capture-llm"))
+
+;; elpaca
+(use-package capture-llm
+  :elpaca (:host github :repo "danliustc/capture-llm"))
 ```
 
-**straight.el**
+## Configure
+
+先配置一个 llm.el provider：
 
 ```elisp
-(use-package llm :ensure t)
-
-(use-package capture-llm
-  :straight (:host github :repo "danliustc/capture-llm")
-  :bind ("C-c C-l" . capture-llm-capture))
-```
-
-**elpaca**
-
-```elisp
-(use-package llm :ensure t)
-
-(use-package capture-llm
-  :elpaca (:host github :repo "danliustc/capture-llm")
-  :bind ("C-c C-l" . capture-llm-capture))
-```
-
-### 配置 LLM 提供商
-
-选一个你有的 API key：
-
-```elisp
-;; DeepSeek (推荐，便宜好用)
-(setq capture-llm-provider (make-llm-deepseek :key "your-api-key" :chat-model "deepseek-chat"))
-
 ;; OpenAI
-(setq capture-llm-provider (make-llm-openai :key "sk-..."))
+(setq capture-llm-provider
+      (make-llm-openai :key "sk-..."))
 
-;; Anthropic (Claude)
-(setq capture-llm-provider (make-llm-anthropic :key "sk-ant-..."))
+;; Anthropic
+(setq capture-llm-provider
+      (make-llm-anthropic :key "sk-ant-..."))
 
-;; Ollama (本地模型，免费)
-(setq capture-llm-provider (make-llm-openai-compatible :key "ollama" :url "http://localhost:11434/v1/"))
-
-;; OpenRouter
-(setq capture-llm-provider (make-llm-openrouter :key "sk-or-..."))
+;; OpenAI-compatible，例如 Ollama 或其他兼容端点
+(setq capture-llm-provider
+      (make-llm-openai-compatible
+       :key "your-api-key"
+       :url "http://localhost:11434/v1/"))
 ```
 
-## 默认分类
+默认分类会引用这几个路径变量：
 
-| 分类 | 文件 | 标题 | 默认状态 | 默认标签 |
-|------|------|------|----------|----------|
-| inbox | inbox.org | Inbox | TODO | — |
-| personal | tasks.org | Tasks | TODO | personal |
-| work | tasks.org | Tasks | TODO | work |
-| someday | tasks.org | Tasks | SOMEDAY | — |
-| ideas | ideas.org | Ideas | — | — |
-| reading | ideas.org | Reading | — | — |
+```elisp
+(setq my/org-inbox "~/org/inbox.org"
+      my/org-tasks "~/org/tasks.org"
+      my/org-ideas "~/org/ideas.org")
+```
 
-## 自定义
+默认分类包括 `inbox`、`personal`、`work`、`someday`、`ideas`、`reading`。如果不适合你的工作流，直接重写 `capture-llm-categories`。
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `capture-llm-provider` | nil | llm.el provider（必填） |
-| `capture-llm-categories` | GTD 默认 | 分类定义 |
-| `capture-llm-tags` | nil（从 `org-tag-alist` 自动读取） | 可用标签 |
-| `capture-llm-confirm` | t | 写入前显示预览 |
-| `capture-llm-extract-time` | t | 从输入中提取时间信息 |
-| `capture-llm-system-prompt` | nil（自动生成） | 覆盖分类 prompt |
-| `capture-llm-temperature` | 0.1 | LLM 温度 |
+## Usage
 
-自定义分类示例：
+```text
+M-x capture-llm-capture
+```
+
+或使用绑定的快捷键：
+
+```text
+C-c C-l
+```
+
+快速捕获，不显示预览：
+
+```text
+M-x capture-llm-quick-capture
+```
+
+配置好分类后，可以运行一次：
+
+```text
+M-x capture-llm-init-guide
+```
+
+它会扫描分类中配置的 org 文件，把已有 heading 提供给 LLM 作为参考。
+
+## Categories
+
+一个分类长这样：
 
 ```elisp
 (setq capture-llm-categories
-  '(("inbox"
-     :description "未分类任务"
-     :file my/org-inbox
-     :heading "Inbox"
-     :state "TODO"
-     :tags nil)
-    ("personal"
-     :description "个人任务"
-     :file my/org-tasks
-     :heading "Tasks"
-     :state "TODO"
-     :tags ("personal"))))
+      '(("inbox"
+         :description "未分类任务，拿不准时放这里"
+         :file "~/org/inbox.org"
+         :heading "Inbox"
+         :state "TODO"
+         :tags nil)
+        ("work"
+         :description "工作任务、会议、项目推进、报告"
+         :file "~/org/tasks.org"
+         :heading "Work"
+         :state "TODO"
+         :tags ("work"))
+        ("ideas"
+         :description "想法、灵感、观察、非行动项"
+         :file "~/org/notes.org"
+         :heading "Ideas"
+         :state nil
+         :tags nil)))
 ```
 
-## 用 AI 工具配置到你的 Emacs 里
+说明：
 
-你不需要手动读完所有代码再改配置。用 Claude Code 或 Codex，直接用自然语言描述你想要的效果，让 AI 帮你写配置。
+- `:description` 给 LLM 看，用来判断分类。
+- `:file` 是写入文件，可以是字符串路径，也可以是值为路径的符号。
+- `:heading` 是写入位置；不存在时会自动创建。
+- `:state` 决定它是不是任务分类。为 nil 时写成普通笔记。
+- `:tags` 是该分类默认附加的标签。
 
-### 第一步：安装项目
+还可以加一些示例，帮助模型贴近你的习惯：
 
-按上面的安装方式（源码或包管理器）把 capture-llm 装好。
-
-### 第二步：让 AI 帮你写配置
-
-在你的 Emacs 配置目录（`~/.emacs.d/` 或 `~/.config/emacs/`）下启动 Claude Code：
-
-```bash
-cd ~/.emacs.d
-claude
+```elisp
+(setq capture-llm-examples
+      '(("work" . "下周一项目汇报")
+        ("personal" . "明天下午三点去医院体检")
+        ("ideas" . "最近注意力太碎了，需要重新整理节奏")))
 ```
 
-然后直接告诉它你的情况：
+## Useful Options
 
-> "帮我把 capture-llm 配置加到 init.el 里。我用 DeepSeek，API key 是 sk-xxx。我的 org 文件在 ~/org/inbox.org 和 ~/org/tasks.org。快捷键用 C-c c。"
+| 变量 | 说明 |
+|------|------|
+| `capture-llm-provider` | llm.el provider，必填 |
+| `capture-llm-categories` | 分类定义 |
+| `capture-llm-tags` | 可用标签；nil 时从 `org-tag-alist` 读取 |
+| `capture-llm-confirm` | 是否写入前预览 |
+| `capture-llm-temperature` | 分类温度，默认 `0.1` |
+| `capture-llm-examples` | few-shot 示例 |
+| `capture-llm-system-prompt` | 完全覆盖默认 prompt |
 
-Claude Code 会读你的 `init.el`，理解你现有的配置风格，然后生成一段能直接用的 elisp。
+## Debug
 
-### 第三步：让 AI 帮你调分类
-
-默认的 6 个分类不一定适合你。告诉 AI 你的需求：
-
-> "帮我改 capture-llm 的分类，我需要：inbox（所有未分类的）、work（工作任务，带 work 标签）、life（生活琐事，带 life 标签）、reading（读书笔记，写到 reading.org）、fitness（健身记录，写到 fitness.org）。"
-
-AI 会生成 `capture-llm-categories` 的配置，你贴进 init.el 就行。
-
-### 第四步：让 AI 帮你改项目本身
-
-如果你想改的不只是配置，而是这个包的行为本身，在项目源码目录下启动 Claude Code：
-
-```bash
-# 源码安装的话
-cd ~/Code/capture-llm && claude
-# 包管理器安装的话，找到对应目录，比如
-# ~/.emacs.d/elpa/capture-llm-*  或  ~/.emacs.d/straight/repos/capture-llm/
-```
-
-然后用自然语言描述你想改什么：
-
-- "帮我加一个分类叫 fitness，写到 fitness.org，带 health 和 exercise 标签"
-- "让预览窗口按时间排序，有 deadline 的排前面"
-- "把 system prompt 改成英文，我想试试英文分类效果是不是更好"
-- "给预览窗口加一个 `r` 键，按 r 可以重新分类"
-- "让 LLM 在分类时同时生成一个 emoji 前缀，比如 work 变成 💼 work"
-
-AI 会直接修改源码，改完之后你用 `M-x capture-llm-test` 测试一下。
-
-### 调试
-
-```
+```text
 M-x capture-llm-test
 ```
 
-测试分类逻辑但不写入任何文件。在 `*capture-llm-debug*` 中查看原始 LLM 响应、解析结果和格式化后的 org entry。
+它只测试分类，不写入文件。结果会显示在 `*capture-llm-debug*`，包含原始 LLM 响应、解析后的 JSON 和最终 org entry。
 
-如果 AI 改出了 bug，把 debug buffer 的内容贴给它：
+## Credits
 
-> "测试失败了，这是 debug 输出：[贴内容]，帮我修一下。"
-
-## 致谢
-
-- [llm.el](https://github.com/ahyatt/llm) — Emacs 的 provider-agnostic LLM 抽象层，本项目的基石
-- [org-mode](https://orgmode.org/) — 我们用 Emacs 的理由
+- [llm.el](https://github.com/ahyatt/llm)
+- [org-mode](https://orgmode.org/)
 
 本项目在 [Claude Code](https://claude.ai/claude-code)、[Xiaomi MiMo](https://github.com/XiaomiMiMo) 和 [OpenAI Codex](https://openai.com/index/codex/) 的帮助下完成。
 
-## 许可证
+## License
 
 GPL-3.0
