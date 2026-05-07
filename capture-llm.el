@@ -325,7 +325,7 @@ your org structure and can make better decisions."
            "- Non-actionable thoughts, observations, journal → note category\n"
            "- \"Want to someday\" items → someday (task category)\n"
            "- Remove time expressions from title\n\n"
-           "Respond with JSON only, no explanation."))))
+           "Respond with JSON only, no explanation.")))))
 
 (defun capture-llm--parse-json (text)
   "Parse JSON from TEXT, handling potential markdown code fences."
