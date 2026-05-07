@@ -26,10 +26,13 @@
 ;;   (setq capture-llm-provider (make-llm-openai :key "sk-..."))
 ;;   (global-set-key (kbd "C-c C-l") 'capture-llm-capture)
 ;;
+;; Optional: scan your org files once so the LLM understands your setup:
+;;   M-x capture-llm-init-guide
+;;
 ;; Usage:
 ;;   C-c C-l, type your task, press Enter.
 ;;   LLM classifies it and shows a preview.
-;;   Press y to confirm, e to edit, n to cancel.
+;;   Press y to confirm, e to edit in a real buffer, c to change category, n to cancel.
 
 ;;; Code:
 
@@ -126,6 +129,13 @@ If nil, a sensible default is generated from category and tag config."
   :type 'number
   :group 'capture-llm)
 
+(defcustom capture-llm-examples nil
+  "Few-shot examples shown in the classification prompt.
+Each element is (CATEGORY-NAME . INPUT-TEXT).
+Example: \\='((\"work\" . \"下周一项目汇报\") (\"personal\" . \"给老婆买花\"))"
+  :type '(repeat (cons string string))
+  :group 'capture-llm)
+
 ;;; ============================================================
 ;;; Debug
 ;;; ============================================================
@@ -173,6 +183,21 @@ If TEXT is nil, prompt in minibuffer."
                         (when (stringp name) name)))
                     org-tag-alist))))
 
+(defun capture-llm--get-todo-states ()
+  "Return active (non-done) TODO state strings from `org-todo-keywords'."
+  (let (states)
+    (dolist (seq org-todo-keywords)
+      (let ((past-bar nil))
+        (dolist (kw (cdr seq))
+          (cond
+           ((string= kw "|") (setq past-bar t))
+           ((not past-bar)
+            (push (replace-regexp-in-string "(.*)" "" kw) states))))))
+    (or (nreverse states) '("TODO" "NEXT" "WAITING" "SOMEDAY"))))
+
+(defvar capture-llm--org-guide nil
+  "Cached org file structure description, built by `capture-llm-init-guide'.")
+
 (defun capture-llm--resolve-file (file)
   "Resolve FILE to a path string.
 FILE can be a string or a symbol whose value is a string."
@@ -181,6 +206,53 @@ FILE can be a string or a symbol whose value is a string."
    ((and (symbolp file) (boundp file) (stringp (symbol-value file)))
     (symbol-value file))
    (t (error "capture-llm: Cannot resolve file: %S" file))))
+
+(defun capture-llm--category-is-task-p (cat-name)
+  "Return non-nil if category CAT-NAME has a TODO state (i.e. is task-like)."
+  (plist-get (capture-llm--category-config cat-name) :state))
+
+(defun capture-llm--scan-org-file (file)
+  "Scan FILE and return a one-line description of its top-level headings."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (let ((fname (file-name-nondirectory file))
+          headings)
+      (goto-char (point-min))
+      (while (re-search-forward "^\\* \\(.*\\)$" nil t)
+        (let ((h (match-string-no-properties 1)))
+          (setq h (replace-regexp-in-string " :[[:alnum:]_@#%:]+:[ \t]*$" "" h))
+          (setq h (replace-regexp-in-string "^[A-Z]\\{2,\\} " "" h))
+          (push (string-trim h) headings)))
+      (format "  %s → sections: [%s]"
+              fname
+              (string-join (delete-dups (nreverse headings)) ", ")))))
+
+;;;###autoload
+(defun capture-llm-init-guide ()
+  "Scan configured org files and cache a guide for better classification.
+Call this once after configuring `capture-llm-categories'.  The guide is
+included automatically in the classification prompt so the LLM understands
+your org structure and can make better decisions."
+  (interactive)
+  (let ((seen (make-hash-table :test 'equal))
+        parts)
+    (dolist (cat capture-llm-categories)
+      (let ((file-spec (plist-get (cdr cat) :file)))
+        (when file-spec
+          (condition-case nil
+              (let ((file (capture-llm--resolve-file file-spec)))
+                (unless (gethash file seen)
+                  (puthash file t seen)
+                  (when (file-exists-p file)
+                    (push (capture-llm--scan-org-file file) parts))))
+            (error nil)))))
+    (setq capture-llm--org-guide
+          (when parts
+            (string-join (nreverse parts) "\n")))
+    (if capture-llm--org-guide
+        (message "capture-llm: Guide ready (%d file(s) scanned). Classification will use your org structure."
+                 (hash-table-count seen))
+      (message "capture-llm: No existing org files found to scan."))))
 
 (defun capture-llm--build-system-prompt ()
   "Build the classification system prompt from config."
@@ -193,44 +265,67 @@ FILE can be a string or a symbol whose value is a string."
                                   (plist-get (cdr cat) :description)))
                         categories "\n"))
              (tags (capture-llm--get-tags))
-             (tag-str (string-join tags ", "))
+             (tag-str (if tags (string-join tags ", ") "(none configured)"))
+             (todo-states (capture-llm--get-todo-states))
+             (state-str (string-join todo-states " | "))
              (now (current-time))
              (today (format-time-string "%Y-%m-%d" now))
-             (weekday (format-time-string "%a" now)))
-        (concat
-         "You are a task classification assistant. "
-         "Given user input, determine the category, tags, TODO state, "
-         "and extract any time information.\n\n"
-         "Current date: " today " (" weekday ")\n\n"
-         "Available categories:\n" cat-desc "\n\n"
-         "Available tags: " tag-str "\n\n"
-         "Return JSON with these fields:\n"
-         "- category: one of the category names above\n"
-         "- tags: array of applicable tags (empty array if none fit)\n"
-         "- todo_state: \"TODO\", \"NEXT\", \"WAITING\", \"SOMEDAY\", or null\n"
-         "- title: concise task title (remove time info from title)\n"
-         "- scheduled: \"YYYY-MM-DD Day HH:MM\" (include time if mentioned) or \"YYYY-MM-DD\" (date only) or null\n"
-         "  Day is abbreviated weekday: Mon, Tue, Wed, Thu, Fri, Sat, Sun\n"
-         "- deadline: \"YYYY-MM-DD Day HH:MM\" or \"YYYY-MM-DD\" or null\n"
-         "  Day is abbreviated weekday: Mon, Tue, Wed, Thu, Fri, Sat, Sun\n"
-         "- notes: extra notes or null\n\n"
-         "Rules:\n"
-         "- Convert Chinese relative dates using the current date above:\n"
-         "  今天 = today, 明天 = today+1, 后天 = today+2, 大后天 = today+3\n"
-         "  下周X = next week's weekday X, 周X = this week's weekday X\n"
-         "  下个月 = next month, 这个月 = this month\n"
-         "- If time is mentioned (e.g. \"下午3点\", \"15:00\"), include it: \"YYYY-MM-DD Day HH:MM\"\n"
-         "  Example: \"2026-05-01 Thu 15:00\"\n"
-         "- If only a date is mentioned, use \"YYYY-MM-DD\" format\n"
-         "- \"deadline\" means the last possible date; \"scheduled\" means when to start/do it\n"
-         "- If only one date is given and it's a due date (截止, 前, 之前), use deadline\n"
-         "- If only one date is given and it's a plan (去, 做, 见), use scheduled\n"
-         "- title should be concise, without time information\n"
-         "- If unsure about category, use \"inbox\"\n"
-         "- Use \"ideas\" for non-actionable thoughts, set todo_state to null\n"
-         "- Use \"someday\" for \"want to do someday\" type items\n"
-         "- Only pick tags that genuinely apply\n"
-         "- Respond with JSON only, no explanation"))))
+             (weekday (format-time-string "%a" now))
+             (example-str
+              (when capture-llm-examples
+                (concat "\n## Classification examples:\n"
+                        (mapconcat
+                         (lambda (ex)
+                           (format "- \"%s\" → %s" (cdr ex) (car ex)))
+                         capture-llm-examples "\n")
+                        "\n"))))
+        (let* ((task-cats (mapcar #'car
+                                  (seq-filter (lambda (c)
+                                                (plist-get (cdr c) :state))
+                                              categories)))
+               (note-cats (mapcar #'car
+                                  (seq-filter (lambda (c)
+                                                (not (plist-get (cdr c) :state)))
+                                              categories)))
+               (cat-types-str
+                (concat
+                 "Task categories (need TODO state, may have dates): "
+                 (string-join task-cats ", ") "\n"
+                 "Note categories (plain notes, no TODO/dates needed): "
+                 (string-join note-cats ", "))))
+          (concat
+           "You are a task classification assistant for Emacs org-mode.\n\n"
+           "Current date: " today " (" weekday ")\n\n"
+           (when capture-llm--org-guide
+             (concat "## User's org file structure:\n"
+                     capture-llm--org-guide "\n\n"))
+           "## Categories (pick exactly one):\n" cat-desc "\n\n"
+           "## Category types:\n" cat-types-str "\n\n"
+           "## Available TODO states: " state-str "\n\n"
+           "## Available tags: " tag-str "\n"
+           "Only use tags from this list. Use empty array if none apply.\n"
+           (or example-str "")
+           "\n## Step 1 — Determine category.\n"
+           "## Step 2 — Based on category type, fill in the JSON fields:\n\n"
+           "For TASK categories, output:\n"
+           "- category, tags, todo_state (one of [" state-str "]), title\n"
+           "- scheduled: \"YYYY-MM-DD Day HH:MM\" or \"YYYY-MM-DD Day\" or null\n"
+           "- deadline: \"YYYY-MM-DD Day HH:MM\" or \"YYYY-MM-DD Day\" or null\n"
+           "- notes: extra context or null\n\n"
+           "For NOTE categories, output:\n"
+           "- category, tags, title, notes\n"
+           "- todo_state: null, scheduled: null, deadline: null\n\n"
+           "## Date/time rules (for task categories):\n"
+           "- 今天=" today ", 明天=today+1, 后天=today+2, 大后天=today+3\n"
+           "- 下周X=next week's X, 周X=this week's X (current weekday: " weekday ")\n"
+           "- Include time when mentioned (e.g. 下午3点 → 15:00)\n"
+           "- 截止/之前/前/due/by → deadline; 去做/计划/会议/见面 → scheduled\n\n"
+           "## Classification rules:\n"
+           "- If unsure, use \"inbox\"\n"
+           "- Non-actionable thoughts, observations, journal → note category\n"
+           "- \"Want to someday\" items → someday (task category)\n"
+           "- Remove time expressions from title\n\n"
+           "Respond with JSON only, no explanation."))))
 
 (defun capture-llm--parse-json (text)
   "Parse JSON from TEXT, handling potential markdown code fences."
@@ -335,32 +430,41 @@ Call ERROR-CALLBACK with error message on failure."
 
 (defun capture-llm--format-org-entry (result &optional level)
   "Format RESULT into an org entry string.
-LEVEL is the heading depth (default 1)."
+LEVEL is the heading depth (default 1).
+For note-type categories (no :state in config), TODO state and planning
+timestamps are omitted regardless of what the LLM returned."
   (let* ((level (or level 1))
          (stars (make-string level ?*))
          (cat-name (capture-llm--result-category result))
          (cat-cfg (capture-llm--category-config cat-name))
-         (todo (or (capture-llm--result-todo result)
-                   (plist-get cat-cfg :state)))
+         (is-task (capture-llm--category-is-task-p cat-name))
+         ;; For note categories, suppress TODO and planning even if LLM returned them
+         (todo (when is-task
+                 (or (capture-llm--result-todo result)
+                     (plist-get cat-cfg :state))))
          (title (capture-llm--result-title result))
-         ;; Merge LLM tags with category default tags
          (llm-tags (capture-llm--result-tags result))
          (default-tags (plist-get cat-cfg :tags))
          (all-tags (delete-dups (append llm-tags default-tags)))
          (tag-str (if all-tags
                       (concat " :" (string-join all-tags ":") ":")
                     ""))
-         (scheduled (capture-llm--string-or-nil
-                     (capture-llm--result-scheduled result)))
-         (deadline (capture-llm--string-or-nil
-                    (capture-llm--result-deadline result)))
+         (scheduled (when is-task
+                      (capture-llm--string-or-nil
+                       (capture-llm--result-scheduled result))))
+         (deadline (when is-task
+                     (capture-llm--string-or-nil
+                      (capture-llm--result-deadline result))))
          (notes (capture-llm--string-or-nil (capture-llm--result-notes result)))
+         (planning (string-join
+                    (delq nil
+                          (list (when scheduled (concat "SCHEDULED: <" scheduled ">"))
+                                (when deadline (concat "DEADLINE: <" deadline ">"))))
+                    " "))
          (parts (list
                  (concat stars " " (if todo (concat todo " ") "") title tag-str))))
-    (when scheduled
-      (setq parts (append parts (list (concat "SCHEDULED: <" scheduled ">")))))
-    (when deadline
-      (setq parts (append parts (list (concat "DEADLINE: <" deadline ">")))))
+    (when (not (string-empty-p planning))
+      (setq parts (append parts (list planning))))
     (setq parts
           (append parts
                   (list ":PROPERTIES:"
@@ -398,10 +502,13 @@ If ENTRY-TEXT is nil, format RESULT as an org entry."
              (concat "^\\(\\*+\\) " (regexp-quote heading)) nil t)
             (let ((parent-level (length (match-string 1))))
               (setq entry-level (1+ parent-level))
-              (goto-char (point-at-eol)))
-          ;; Heading not found, create it at end
+              (goto-char (line-beginning-position))
+              (org-end-of-subtree t))
+          ;; Heading not found, create it at end of file
           (goto-char (point-max))
-          (insert (concat "\n* " heading))))
+          (unless (bolp) (insert "\n"))
+          (insert "* " heading)
+          (setq entry-level 2)))
       ;; Format entry with correct level unless caller provided edited text.
       (setq entry (or entry-text
                       (capture-llm--format-org-entry result entry-level)))
@@ -412,6 +519,44 @@ If ENTRY-TEXT is nil, format RESULT as an org entry."
       (message "capture-llm: Saved to %s under %s"
                (file-name-nondirectory file)
                (or heading "top level")))))
+
+(defun capture-llm--edit-in-buffer (entry)
+  "Open ENTRY in a dedicated org-mode buffer for editing.
+C-c C-c saves, C-c C-k cancels.  Returns edited text or nil."
+  (let ((buf (get-buffer-create "*capture-llm-edit*"))
+        edited)
+    (with-current-buffer buf
+      (erase-buffer)
+      (org-mode)
+      (insert entry)
+      (goto-char (point-min))
+      (local-set-key (kbd "C-c C-c")
+                     (lambda ()
+                       (interactive)
+                       (setq edited (buffer-string))
+                       (exit-recursive-edit)))
+      (local-set-key (kbd "C-c C-k")
+                     (lambda () (interactive) (exit-recursive-edit))))
+    (pop-to-buffer buf)
+    (message "Edit entry.  C-c C-c to confirm, C-c C-k to go back.")
+    (condition-case nil (recursive-edit) (quit nil))
+    (when-let ((win (get-buffer-window buf t)))
+      (quit-window nil win))
+    edited))
+
+(defun capture-llm--change-category (result)
+  "Interactively pick a new category for RESULT and return updated result."
+  (let* ((cats (mapcar #'car capture-llm-categories))
+         (chosen (completing-read "Change category to: " cats nil t))
+         (new-cfg (capture-llm--category-config chosen)))
+    `((category . ,chosen)
+      (tags . ,(cdr (assq 'tags result)))
+      (todo_state . ,(or (plist-get new-cfg :state)
+                         (cdr (assq 'todo_state result))))
+      (title . ,(cdr (assq 'title result)))
+      (scheduled . ,(cdr (assq 'scheduled result)))
+      (deadline . ,(cdr (assq 'deadline result)))
+      (notes . ,(cdr (assq 'notes result))))))
 
 ;;; ============================================================
 ;;; Preview
@@ -456,7 +601,7 @@ If ENTRY-TEXT is nil, format RESULT as an org entry."
       (capture-llm--entry-level-for-result result)) "\n"
      "\n"
      "────────────────────────────────────────────\n"
-     "  y = confirm  |  e = edit entry  |  n = cancel\n")))
+     "  y = confirm  |  e = edit  |  c = change category  |  n = cancel\n")))
 
 (defun capture-llm--preview (result)
   "Show preview buffer for RESULT, ask user to confirm.
@@ -471,12 +616,13 @@ Returns \\='confirm, \\='edit, or \\='cancel."
       (display-buffer buf))
     ;; Ask user
     (let ((choice (read-char-choice
-                   "Confirm? [y]es / [e]dit / [n] cancel "
-                   '(?y ?e ?n ?Y ?E ?N))))
+                   "Confirm? [y]es / [e]dit / [c]hange category / [n] cancel "
+                   '(?y ?e ?c ?n ?Y ?E ?C ?N))))
       (quit-window nil (get-buffer-window buf))
       (pcase choice
         ((or ?y ?Y) 'confirm)
         ((or ?e ?E) 'edit)
+        ((or ?c ?C) 'change-category)
         ((or ?n ?N) 'cancel)))))
 
 ;;; ============================================================
@@ -499,17 +645,25 @@ The LLM classifies the input and writes it to the appropriate org file."
      ;; Success callback
      (lambda (result)
        (if capture-llm-confirm
-           (pcase (capture-llm--preview result)
-             ('confirm
-              (capture-llm--write-entry result))
-             ('edit
-              (let* ((entry (capture-llm--format-org-entry
-                             result
-                             (capture-llm--entry-level-for-result result)))
-                     (edited (read-string "Edit entry: " entry)))
-                (capture-llm--write-entry-text result edited)))
-             ('cancel
-              (message "capture-llm: Cancelled")))
+           (let ((current result)
+                 (done nil))
+             (while (not done)
+               (pcase (capture-llm--preview current)
+                 ('confirm
+                  (capture-llm--write-entry current)
+                  (setq done t))
+                 ('edit
+                  (let* ((level (capture-llm--entry-level-for-result current))
+                         (entry (capture-llm--format-org-entry current level))
+                         (edited (capture-llm--edit-in-buffer entry)))
+                    (when edited
+                      (capture-llm--write-entry-text current edited)
+                      (setq done t))))
+                 ('change-category
+                  (setq current (capture-llm--change-category current)))
+                 ('cancel
+                  (message "capture-llm: Cancelled")
+                  (setq done t)))))
          (capture-llm--write-entry result)))
      ;; Error callback
      (lambda (err-msg)
