@@ -18,8 +18,10 @@
 ;;; Commentary:
 
 ;; capture-llm uses an LLM to automatically classify natural language input
-;; and write it to the appropriate org file with correct template, tags,
-;; TODO state, and scheduled/deadline times.
+;; and create org entries with correct template, tags, TODO state, and
+;; scheduled/deadline times.  By default captures are written to the configured
+;; inbox category; set `capture-llm-destination' to `classified' to route each
+;; entry to the LLM-selected category.
 ;;
 ;; Setup:
 ;;   (require 'capture-llm)
@@ -102,6 +104,24 @@ FILE is a string path or a symbol whose value is a path (e.g. my/org-inbox)."
   :type '(alist :key-type string :value-type plist)
   :group 'capture-llm)
 
+(defcustom capture-llm-default-category "inbox"
+  "Category used as the default capture destination.
+This category is also used when the LLM returns an unknown or empty category."
+  :type 'string
+  :group 'capture-llm)
+
+(defcustom capture-llm-destination 'inbox
+  "How capture targets are chosen.
+When set to `inbox', every capture is written to
+`capture-llm-default-category', while classification still enriches the entry
+with TODO state, dates, tags, and note/task formatting.
+
+When set to `classified', captures are written directly to the category chosen
+by the LLM, which matches the package's original routing behavior."
+  :type '(choice (const :tag "Always write to default inbox category" inbox)
+                 (const :tag "Write to classified category" classified))
+  :group 'capture-llm)
+
 (defcustom capture-llm-tags nil
   "Available tags for classification.
 If nil, auto-detected from `org-tag-alist'."
@@ -136,6 +156,26 @@ Example: \\='((\"work\" . \"下周一项目汇报\") (\"personal\" . \"给老婆
   :type '(repeat (cons string string))
   :group 'capture-llm)
 
+(defcustom capture-llm-guide-sources nil
+  "Org files or directories used by `capture-llm-init-guide'.
+Each source may be a path string or a symbol whose value is a path string.
+Directory sources are scanned recursively for .org files.
+
+If nil, infer sources from `org-agenda-files', `org-directory', and
+`capture-llm-categories'."
+  :type '(repeat (choice string symbol))
+  :group 'capture-llm)
+
+(defcustom capture-llm-guide-max-files 40
+  "Maximum number of org files to scan for the guide."
+  :type 'integer
+  :group 'capture-llm)
+
+(defcustom capture-llm-guide-max-tag-examples 12
+  "Maximum number of tagged headings included as examples in the guide."
+  :type 'integer
+  :group 'capture-llm)
+
 ;;; ============================================================
 ;;; Debug
 ;;; ============================================================
@@ -145,6 +185,12 @@ Example: \\='((\"work\" . \"下周一项目汇报\") (\"personal\" . \"给老婆
 
 (defvar capture-llm--debug-last-result nil
   "Last parsed result, for debugging.")
+
+(defvar capture-llm--org-guide nil
+  "Cached org file structure description, built by `capture-llm-init-guide'.")
+
+(defvar capture-llm--org-guide-tags nil
+  "Tags learned from org files by `capture-llm-init-guide'.")
 
 (defun capture-llm-test (&optional text)
   "Test classification and show raw LLM output.
@@ -176,12 +222,15 @@ If TEXT is nil, prompt in minibuffer."
 
 (defun capture-llm--get-tags ()
   "Return available tags as a list of strings."
-  (or capture-llm-tags
-      (delq nil
-            (mapcar (lambda (tag)
-                      (let ((name (if (consp tag) (car tag) tag)))
-                        (when (stringp name) name)))
-                    org-tag-alist))))
+  (delete-dups
+   (or capture-llm-tags
+       (append
+        capture-llm--org-guide-tags
+        (delq nil
+              (mapcar (lambda (tag)
+                        (let ((name (if (consp tag) (car tag) tag)))
+                          (when (stringp name) name)))
+                      org-tag-alist))))))
 
 (defun capture-llm--get-todo-states ()
   "Return active (non-done) TODO state strings from `org-todo-keywords'."
@@ -194,9 +243,6 @@ If TEXT is nil, prompt in minibuffer."
            ((not past-bar)
             (push (replace-regexp-in-string "(.*)" "" kw) states))))))
     (or (nreverse states) '("TODO" "NEXT" "WAITING" "SOMEDAY"))))
-
-(defvar capture-llm--org-guide nil
-  "Cached org file structure description, built by `capture-llm-init-guide'.")
 
 (defun capture-llm--resolve-file (file)
   "Resolve FILE to a path string.
@@ -211,47 +257,152 @@ FILE can be a string or a symbol whose value is a string."
   "Return non-nil if category CAT-NAME has a TODO state (i.e. is task-like)."
   (plist-get (capture-llm--category-config cat-name) :state))
 
+(defun capture-llm--hash-keys (table)
+  "Return keys from hash TABLE."
+  (let (keys)
+    (maphash (lambda (key _value) (push key keys)) table)
+    (nreverse keys)))
+
+(defun capture-llm--increment-count (key table)
+  "Increment KEY in hash TABLE."
+  (puthash key (1+ (gethash key table 0)) table))
+
+(defun capture-llm--format-counts (table &optional limit)
+  "Format hash TABLE counts as \"key(count)\" sorted by count.
+When LIMIT is non-nil, include at most LIMIT items."
+  (let* ((items nil)
+         (_ (maphash (lambda (key value) (push (cons key value) items)) table))
+         (sorted (sort items (lambda (a b)
+                               (if (= (cdr a) (cdr b))
+                                   (string< (car a) (car b))
+                                 (> (cdr a) (cdr b))))))
+         (limited (if limit (seq-take sorted limit) sorted)))
+    (mapconcat (lambda (item) (format "%s(%d)" (car item) (cdr item)))
+               limited ", ")))
+
+(defun capture-llm--normalize-tags (tags)
+  "Return TAGS as a list of strings."
+  (cond
+   ((null tags) nil)
+   ((listp tags) tags)
+   ((stringp tags)
+    (delq nil
+          (mapcar (lambda (tag)
+                    (unless (string-empty-p tag) tag))
+                  (split-string tags ":" t))))
+   (t nil)))
+
+(defun capture-llm--org-file-p (file)
+  "Return non-nil when FILE is an org file."
+  (and (stringp file)
+       (string-match-p "\\.org\\'" file)))
+
+(defun capture-llm--expand-guide-source (source)
+  "Return org files from guide SOURCE."
+  (let ((path (capture-llm--resolve-file source)))
+    (cond
+     ((file-directory-p path)
+      (directory-files-recursively path "\\.org\\'"))
+     ((and (file-regular-p path) (capture-llm--org-file-p path))
+      (list path))
+     (t nil))))
+
+(defun capture-llm--default-guide-sources ()
+  "Return default sources for `capture-llm-init-guide'."
+  (let (sources)
+    (when (and (boundp 'org-directory)
+               (stringp org-directory))
+      (push org-directory sources))
+    (when (boundp 'org-agenda-files)
+      (dolist (file org-agenda-files)
+        (push file sources)))
+    (dolist (cat capture-llm-categories)
+      (when-let ((file (plist-get (cdr cat) :file)))
+        (push file sources)))
+    (nreverse sources)))
+
+(defun capture-llm--guide-files ()
+  "Return unique org files to scan for the guide."
+  (let ((seen (make-hash-table :test 'equal))
+        files)
+    (dolist (source (or capture-llm-guide-sources
+                        (capture-llm--default-guide-sources)))
+      (condition-case nil
+          (dolist (file (capture-llm--expand-guide-source source))
+            (let ((expanded (expand-file-name file)))
+              (unless (gethash expanded seen)
+                (puthash expanded t seen)
+                (push expanded files))))
+        (error nil)))
+    (seq-take (nreverse files) capture-llm-guide-max-files)))
+
 (defun capture-llm--scan-org-file (file)
-  "Scan FILE and return a one-line description of its top-level headings."
+  "Scan FILE and return a plist with org guide data."
   (with-temp-buffer
     (insert-file-contents file)
+    (delay-mode-hooks (org-mode))
     (let ((fname (file-name-nondirectory file))
-          headings)
+          headings
+          examples
+          (tag-counts (make-hash-table :test 'equal))
+          (todo-counts (make-hash-table :test 'equal)))
       (goto-char (point-min))
-      (while (re-search-forward "^\\* \\(.*\\)$" nil t)
-        (let ((h (match-string-no-properties 1)))
-          (setq h (replace-regexp-in-string " :[[:alnum:]_@#%:]+:[ \t]*$" "" h))
-          (setq h (replace-regexp-in-string "^[A-Z]\\{2,\\} " "" h))
-          (push (string-trim h) headings)))
-      (format "  %s → sections: [%s]"
-              fname
-              (string-join (delete-dups (nreverse headings)) ", ")))))
+      (while (re-search-forward org-heading-regexp nil t)
+        (let* ((components (org-heading-components))
+               (level (nth 0 components))
+               (todo (nth 2 components))
+               (title (string-trim (or (nth 4 components) "")))
+               (tags (capture-llm--normalize-tags (nth 5 components))))
+          (when (= level 1)
+            (push title headings))
+          (when todo
+            (capture-llm--increment-count todo todo-counts))
+          (dolist (tag tags)
+            (capture-llm--increment-count tag tag-counts))
+          (when (and tags (< (length examples)
+                             capture-llm-guide-max-tag-examples))
+            (push (format "%s → %s" title
+                          (mapconcat (lambda (tag) (concat "#" tag))
+                                     tags " "))
+                  examples))))
+      (list
+       :description
+       (format
+        "  %s\n    sections: [%s]\n    tags: %s\n    TODO states: %s\n    tagged examples: %s"
+        fname
+        (string-join (delete-dups (nreverse headings)) ", ")
+        (let ((tag-str (capture-llm--format-counts tag-counts 20)))
+          (if (string-empty-p tag-str) "(none)" tag-str))
+        (let ((todo-str (capture-llm--format-counts todo-counts 10)))
+          (if (string-empty-p todo-str) "(none)" todo-str))
+        (if examples
+            (string-join (nreverse examples) "; ")
+          "(none)"))
+       :tags (capture-llm--hash-keys tag-counts)))))
 
 ;;;###autoload
 (defun capture-llm-init-guide ()
-  "Scan configured org files and cache a guide for better classification.
-Call this once after configuring `capture-llm-categories'.  The guide is
-included automatically in the classification prompt so the LLM understands
-your org structure and can make better decisions."
+  "Scan org files and cache a guide for better classification.
+The guide summarizes files, headings, tags, TODO states, and tagged examples.
+It is included automatically in the classification prompt so the LLM can follow
+your existing org structure and tagging habits."
   (interactive)
-  (let ((seen (make-hash-table :test 'equal))
-        parts)
-    (dolist (cat capture-llm-categories)
-      (let ((file-spec (plist-get (cdr cat) :file)))
-        (when file-spec
-          (condition-case nil
-              (let ((file (capture-llm--resolve-file file-spec)))
-                (unless (gethash file seen)
-                  (puthash file t seen)
-                  (when (file-exists-p file)
-                    (push (capture-llm--scan-org-file file) parts))))
-            (error nil)))))
+  (let ((files (capture-llm--guide-files))
+        parts
+        tags)
+    (dolist (file files)
+      (when (file-exists-p file)
+        (let ((scan (capture-llm--scan-org-file file)))
+          (push (plist-get scan :description) parts)
+          (setq tags (append (plist-get scan :tags) tags)))))
+    (setq capture-llm--org-guide-tags
+          (delete-dups (sort tags #'string<)))
     (setq capture-llm--org-guide
           (when parts
             (string-join (nreverse parts) "\n")))
     (if capture-llm--org-guide
-        (message "capture-llm: Guide ready (%d file(s) scanned). Classification will use your org structure."
-                 (hash-table-count seen))
+        (message "capture-llm: Guide ready (%d file(s) scanned). Classification will use your org structure and tags."
+                 (length files))
       (message "capture-llm: No existing org files found to scan."))))
 
 (defun capture-llm--build-system-prompt ()
@@ -297,16 +448,18 @@ your org structure and can make better decisions."
            "You are a task classification assistant for Emacs org-mode.\n\n"
            "Current date: " today " (" weekday ")\n\n"
            (when capture-llm--org-guide
-             (concat "## User's org file structure:\n"
+             (concat "## User's org knowledge base summary:\n"
                      capture-llm--org-guide "\n\n"))
            "## Categories (pick exactly one):\n" cat-desc "\n\n"
            "## Category types:\n" cat-types-str "\n\n"
            "## Available TODO states: " state-str "\n\n"
            "## Available tags: " tag-str "\n"
-           "Only use tags from this list. Use empty array if none apply.\n"
+           "Tags are the primary semantic classification. Prefer existing tags from this list and from the org summary above. Use multiple tags when useful, but avoid inventing new tags unless the existing taxonomy clearly lacks a fit. Use empty array only when no tag applies.\n"
            (or example-str "")
-           "\n## Step 1 — Determine category.\n"
-           "## Step 2 — Based on category type, fill in the JSON fields:\n\n"
+           "\n## Step 1 — Determine whether this is a task or a note.\n"
+           "## Step 2 — Choose the best category for entry type/default state, not for file routing.\n"
+           "## Step 3 — Choose tags that match the user's existing org habits.\n"
+           "## Step 4 — Based on category type, fill in the JSON fields:\n\n"
            "For TASK categories, output:\n"
            "- category, tags, todo_state (one of [" state-str "]), title\n"
            "- scheduled: \"YYYY-MM-DD Day HH:MM\" or \"YYYY-MM-DD Day\" or null\n"
@@ -322,6 +475,7 @@ your org structure and can make better decisions."
            "- 截止/之前/前/due/by → deadline; 去做/计划/会议/见面 → scheduled\n\n"
            "## Classification rules:\n"
            "- If unsure, use \"inbox\"\n"
+           "- Prefer tagging over file/category splitting; category is secondary\n"
            "- Non-actionable thoughts, observations, journal → note category\n"
            "- \"Want to someday\" items → someday (task category)\n"
            "- Remove time expressions from title\n\n"
@@ -369,7 +523,10 @@ Call ERROR-CALLBACK with error message on failure."
 
 (defun capture-llm--result-category (result)
   "Extract category name from RESULT."
-  (or (cdr (assq 'category result)) "inbox"))
+  (let ((category (cdr (assq 'category result))))
+    (if (capture-llm--category-config category)
+        category
+      capture-llm-default-category)))
 
 (defun capture-llm--result-tags (result)
   "Extract tags from RESULT as a list of strings."
@@ -407,11 +564,18 @@ Call ERROR-CALLBACK with error message on failure."
 
 (defun capture-llm--category-config (category-name)
   "Get the config plist for CATEGORY-NAME."
-  (cdr (assoc category-name capture-llm-categories)))
+  (when category-name
+    (cdr (assoc category-name capture-llm-categories))))
+
+(defun capture-llm--target-category (result)
+  "Return the category used as the write destination for RESULT."
+  (pcase capture-llm-destination
+    ('classified (capture-llm--result-category result))
+    (_ capture-llm-default-category)))
 
 (defun capture-llm--entry-level-for-result (result)
   "Return the org heading level that RESULT will be written with."
-  (let* ((cat-name (capture-llm--result-category result))
+  (let* ((cat-name (capture-llm--target-category result))
          (cat-cfg (capture-llm--category-config cat-name))
          (file (capture-llm--resolve-file
                 (or (plist-get cat-cfg :file) 'my/org-inbox)))
@@ -482,7 +646,7 @@ timestamps are omitted regardless of what the LLM returned."
 (defun capture-llm--write-entry-text (result entry-text)
   "Write ENTRY-TEXT for RESULT to the appropriate file.
 If ENTRY-TEXT is nil, format RESULT as an org entry."
-  (let* ((cat-name (capture-llm--result-category result))
+  (let* ((cat-name (capture-llm--target-category result))
          (cat-cfg (capture-llm--category-config cat-name))
          (file (capture-llm--resolve-file
                 (or (plist-get cat-cfg :file) 'my/org-inbox)))
@@ -569,6 +733,8 @@ C-c C-c saves, C-c C-k cancels.  Returns edited text or nil."
   "Format a preview string for RESULT."
   (let* ((cat-name (capture-llm--result-category result))
          (cat-cfg (capture-llm--category-config cat-name))
+         (target-name (capture-llm--target-category result))
+         (target-cfg (capture-llm--category-config target-name))
          (todo (or (capture-llm--result-todo result)
                    (plist-get cat-cfg :state) "—"))
          (title (capture-llm--result-title result))
@@ -579,14 +745,15 @@ C-c C-c saves, C-c C-k cancels.  Returns edited text or nil."
          (deadline (or (capture-llm--result-deadline result) "—"))
          (notes (or (capture-llm--result-notes result) "—"))
          (file (capture-llm--resolve-file
-                (or (plist-get cat-cfg :file) 'my/org-inbox))))
+                (or (plist-get target-cfg :file) 'my/org-inbox))))
     (concat
      "╔══════════════════════════════════════════╗\n"
      "║         capture-llm Preview              ║\n"
      "╚══════════════════════════════════════════╝\n\n"
      "  Category:   " cat-name "\n"
+     "  Destination: " target-name "\n"
      "  File:       " (file-name-nondirectory file) "\n"
-     "  Heading:    " (or (plist-get cat-cfg :heading) "(top level)") "\n"
+     "  Heading:    " (or (plist-get target-cfg :heading) "(top level)") "\n"
      "  State:      " todo "\n"
      "  Title:      " title "\n"
      "  Tags:       " (if all-tags (string-join all-tags ", ") "(none)") "\n"
